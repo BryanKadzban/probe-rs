@@ -11,7 +11,7 @@ use gimli::{
     BaseAddresses, DebugFrame, RunTimeEndian, UnwindContext, UnwindSection, UnwindTableRow,
     read::RegisterRule,
 };
-use object::read::{Object, ObjectSection};
+use object::read::{Object, ObjectSection, ObjectSymbol};
 use probe_rs::{
     CoreRegister, Error, InstructionSet, MemoryInterface, RegisterDataType, RegisterRole,
     RegisterValue, UnwindRule,
@@ -29,6 +29,12 @@ pub(crate) type GimliAttribute = gimli::Attribute<GimliReader>;
 
 pub(crate) type DwarfReader = gimli::read::EndianRcSlice<RunTimeEndian>;
 
+pub struct Symbol {
+    pub name: String, // mangled internally, demangled externally
+    pub address: u64,
+    pub size: u64,
+}
+
 /// Debug information which is parsed from DWARF debugging information.
 pub struct DebugInfo {
     pub(crate) dwarf: gimli::Dwarf<DwarfReader>,
@@ -41,6 +47,8 @@ pub struct DebugInfo {
     pub(crate) endianness: gimli::RunTimeEndian,
 
     pub(crate) addr2line: Option<addr2line::Loader>,
+
+    pub(crate) symbols: Vec<Symbol>,
 }
 
 impl DebugInfo {
@@ -105,6 +113,16 @@ impl DebugInfo {
             };
         }
 
+        let symbols: Vec<_> = object
+            .symbols()
+            .filter(|sym| sym.name().is_ok())
+            .map(|sym| Symbol {
+                name: sym.name().unwrap().to_string(),
+                address: sym.address(),
+                size: sym.size(),
+            })
+            .collect();
+
         Ok(DebugInfo {
             dwarf: dwarf_cow,
             frame_section,
@@ -114,6 +132,7 @@ impl DebugInfo {
             unit_infos,
             endianness,
             addr2line: None,
+            symbols: symbols,
         })
     }
 
@@ -1016,6 +1035,46 @@ impl DebugInfo {
                 "Unimplemented attribute value {other_attribute_value:?}"
             ))),
         }
+    }
+
+    // Here, a "unit subsequence" is a sequence of the alphanumeric units of a
+    // name, which appear in order in the matching names.  The units are
+    // separated by non-alphanumeric-non-underscore characters. So for example,
+    // <crate name>::init::init_resources::foo is returned if you ask for
+    // "init" or "init_resources" or "init::foo", but not "resources" or
+    // "foo::init".
+    //
+    // Note that we return demangled names in the Symbol instances here.
+    pub fn lookup_symbol_by_unit_subsequence(&self, units: &str) -> Vec<Symbol> {
+        fn split_func(c: char) -> bool {
+            !c.is_alphanumeric() && c != '_'
+        }
+        let name_units: Vec<_> = units.split(split_func).filter(|s| !s.is_empty()).collect();
+
+        self.symbols
+            .iter()
+            .filter_map(|sym| {
+                let demangled = rustc_demangle::demangle(&sym.name).to_string();
+                let mut expected_iter = name_units.iter();
+                let mut next_expected_unit = expected_iter.next();
+                for sym_unit in demangled.split(split_func) {
+                    if let Some(&expected) = next_expected_unit
+                        && sym_unit == expected
+                    {
+                        next_expected_unit = expected_iter.next();
+                    }
+                }
+                if next_expected_unit.is_none() {
+                    Some(Symbol {
+                        name: demangled,
+                        address: sym.address,
+                        size: sym.size,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 

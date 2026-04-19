@@ -72,7 +72,28 @@ fn disassemble(
         mem_addr.0
     } else {
         // Try to resolve a global symbol
-        return Err(DebuggerError::Unimplemented);
+        let Some(ref debug_info) = target_core.core_data.debug_info else {
+            return Err(DebuggerError::UserMessage(format!(
+                "Tried to resolve a function name {address_str:?} but no symbols are loaded."
+            )));
+        };
+        let symbols = debug_info.lookup_symbol_by_unit_subsequence(address_str);
+        if symbols.len() == 0 {
+            return Err(DebuggerError::UserMessage(format!(
+                "Tried to resolve a function name {address_str:?} which is not in the binary."
+            )));
+        }
+        if symbols.len() > 1 {
+            let syms = symbols
+                .iter()
+                .map(|sym| sym.name.clone())
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            return Err(DebuggerError::UserMessage(format!(
+                "Found multiple symbols matching {address_str:?}; need to disambiguate.  Found:\n  {syms}"
+            )));
+        }
+        symbols[0].address
     } as i64;
 
     let instructions: i64 = parse_int::parse(instructions_str).map_err(|error| {
